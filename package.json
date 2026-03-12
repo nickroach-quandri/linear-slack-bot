@@ -1,0 +1,19 @@
+{
+  "name": "linear-slack-bot",
+  "version": "1.0.0",
+  "description": "Slack slash command that generates AI-powered Linear ticket summaries per customer",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
+    "@linear/sdk": "^18.0.0",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
