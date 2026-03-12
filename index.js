@@ -1,104 +1,122 @@
 import express from "express";
-import { LinearClient } from "@linear/sdk";
 import Anthropic from "@anthropic-ai/sdk";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-const linear = new LinearClient({ apiKey: process.env.LINEAR_API_KEY });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const LINEAR_API_KEY = process.env.LINEAR_API_KEY;
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Linear GraphQL helper ──────────────────────────────────────────────────
 
-function since30Days() {
-  const d = new Date();
-  d.setDate(d.getDate() - 30);
-  return d;
+async function linearQuery(query, variables = {}) {
+  const res = await fetch("https://api.linear.app/graphql", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: LINEAR_API_KEY,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (json.errors) throw new Error(json.errors[0].message);
+  return json.data;
 }
 
-async function fetchTickets(customerQuery) {
-  const cutoff = since30Days();
+// ── Fetch all customers matching the query name ────────────────────────────
 
-  // Step 1: Find the customer by name to get their ID
-  const customersResult = await linear.customers({
-    filter: { name: { containsIgnoreCase: customerQuery } },
-    first: 5,
-  });
-
-  if (!customersResult.nodes.length) {
-    return { tickets: [], customerFound: false };
-  }
-
-  const customer = customersResult.nodes[0];
-
-  // Step 2: Get all customer needs (which link customers to issues) 
-  const needsResult = await linear.customerNeeds({
-    filter: { customer: { id: { eq: customer.id } } },
-    first: 250,
-  });
-
-  if (!needsResult.nodes.length) {
-    return { tickets: [], customerFound: true, customerName: customer.name };
-  }
-
-  // Step 3: Extract issue IDs from customer needs
-  const issueIds = [];
-  for (const need of needsResult.nodes) {
-    const issue = await need.issue;
-    if (issue?.id) issueIds.push(issue.id);
-  }
-
-  if (!issueIds.length) {
-    return { tickets: [], customerFound: true, customerName: customer.name };
-  }
-
-  // Step 4: Fetch full issue details for all linked issues in parallel
-  const issueDetails = await Promise.all(
-    issueIds.map(async (id) => {
-      try {
-        const issue = await linear.issue(id);
-        const [state, assignee] = await Promise.all([
-          issue.state,
-          issue.assignee,
-        ]);
-
-        const stateType = state?.type || "unknown";
-        const updatedAt = new Date(issue.updatedAt);
-
-        // Skip completed tickets older than 30 days
-        if (stateType === "completed" && updatedAt < cutoff) return null;
-        // Skip cancelled tickets
-        if (stateType === "cancelled") return null;
-
-        return {
-          id: issue.identifier,
-          title: issue.title,
-          description: (issue.description || "").slice(0, 200),
-          status: state?.name || "Unknown",
-          stateType,
-          priority: issue.priority,
-          updatedAt: issue.updatedAt,
-          url: issue.url,
-          assignee: assignee?.name || "Unassigned",
-        };
-      } catch {
-        return null;
+async function findCustomer(customerQuery) {
+  const data = await linearQuery(`
+    query FindCustomer($query: String!) {
+      customers(filter: { name: { containsIgnoreCase: $query } }, first: 5) {
+        nodes { id name }
       }
-    })
-  );
-
-  const tickets = issueDetails.filter(Boolean);
-  return { tickets, customerFound: true, customerName: customer.name };
+    }
+  `, { query: customerQuery });
+  return data.customers.nodes[0] || null;
 }
+
+// ── Fetch all issues linked to a customer via customer needs ───────────────
+
+async function fetchIssuesByCustomer(customerId) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 30);
+
+  // Paginate through all customer needs for this customer
+  let allNeeds = [];
+  let cursor = null;
+  let hasMore = true;
+
+  while (hasMore) {
+    const data = await linearQuery(`
+      query GetCustomerNeeds($customerId: ID!, $cursor: String) {
+        customerNeeds(
+          filter: { customer: { id: { eq: $customerId } } }
+          first: 250
+          after: $cursor
+        ) {
+          nodes {
+            issue {
+              id
+              identifier
+              title
+              description
+              url
+              priority
+              updatedAt
+              state { name type }
+              assignee { name }
+            }
+          }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    `, { customerId, cursor });
+
+    const page = data.customerNeeds;
+    allNeeds = allNeeds.concat(page.nodes);
+    hasMore = page.pageInfo.hasNextPage;
+    cursor = page.pageInfo.endCursor;
+  }
+
+  // Extract and deduplicate issues
+  const seen = new Set();
+  const tickets = [];
+
+  for (const need of allNeeds) {
+    const issue = need.issue;
+    if (!issue || seen.has(issue.id)) continue;
+    seen.add(issue.id);
+
+    const stateType = issue.state?.type || "unknown";
+    const updatedAt = new Date(issue.updatedAt);
+
+    // Skip cancelled tickets
+    if (stateType === "cancelled") continue;
+    // Skip completed tickets older than 30 days
+    if (stateType === "completed" && updatedAt < cutoff) continue;
+
+    tickets.push({
+      id: issue.identifier,
+      title: issue.title,
+      description: (issue.description || "").slice(0, 200),
+      status: issue.state?.name || "Unknown",
+      stateType,
+      priority: issue.priority,
+      updatedAt: issue.updatedAt,
+      url: issue.url,
+      assignee: issue.assignee?.name || "Unassigned",
+    });
+  }
+
+  return tickets;
+}
+
+// ── Categorize and sort tickets ────────────────────────────────────────────
 
 function categorize(tickets) {
-  const inProgress = [];
-  const review = [];
-  const qa = [];
-  const completed = [];
-  const todo = [];
-  const backlog = [];
+  const inProgress = [], review = [], qa = [], completed = [], todo = [], backlog = [];
 
   for (const t of tickets) {
     const s = t.status.toLowerCase();
@@ -106,12 +124,7 @@ function categorize(tickets) {
     else if (s.includes("review")) review.push(t);
     else if (s.includes("qa")) qa.push(t);
     else if (t.stateType === "completed") completed.push(t);
-    else if (
-      s.includes("todo") ||
-      s.includes("to-do") ||
-      s.includes("to do") ||
-      t.stateType === "unstarted"
-    ) todo.push(t);
+    else if (s.includes("todo") || s.includes("to-do") || s.includes("to do") || t.stateType === "unstarted") todo.push(t);
     else if (t.stateType === "backlog" || s.includes("backlog")) backlog.push(t);
     else inProgress.push(t);
   }
@@ -132,6 +145,8 @@ function categorize(tickets) {
   };
 }
 
+// ── Build AI summary ───────────────────────────────────────────────────────
+
 async function buildSummary(customerName, tickets) {
   if (!tickets.length) {
     return `No active Linear tickets found for *${customerName}*.`;
@@ -142,10 +157,9 @@ async function buildSummary(customerName, tickets) {
   const msg = await anthropic.messages.create({
     model: "claude-sonnet-4-20250514",
     max_tokens: 2000,
-    messages: [
-      {
-        role: "user",
-        content: `You are a CSM assistant. Generate a Slack summary for customer "${customerName}".
+    messages: [{
+      role: "user",
+      content: `You are a CSM assistant. Generate a Slack summary for customer "${customerName}".
 
 EXACT FORMAT:
 
@@ -182,27 +196,13 @@ RULES:
 - Keep it tight
 
 --- TICKET DATA ---
-
-IN PROGRESS:
-${JSON.stringify(inProgress, null, 2)}
-
-IN REVIEW:
-${JSON.stringify(review, null, 2)}
-
-QA:
-${JSON.stringify(qa, null, 2)}
-
-RECENTLY COMPLETED:
-${JSON.stringify(completed, null, 2)}
-
-TODO:
-${JSON.stringify(todo, null, 2)}
-
-BACKLOG:
-${JSON.stringify(backlog, null, 2)}
-`,
-      },
-    ],
+IN PROGRESS: ${JSON.stringify(inProgress, null, 2)}
+IN REVIEW: ${JSON.stringify(review, null, 2)}
+QA: ${JSON.stringify(qa, null, 2)}
+RECENTLY COMPLETED: ${JSON.stringify(completed, null, 2)}
+TODO: ${JSON.stringify(todo, null, 2)}
+BACKLOG: ${JSON.stringify(backlog, null, 2)}`,
+    }],
   });
 
   return msg.content[0].text;
@@ -235,22 +235,21 @@ app.post("/slack/linear-summary", async (req, res) => {
   });
 
   try {
-    const { tickets, customerFound, customerName } = await fetchTickets(customerQuery);
+    const customer = await findCustomer(customerQuery);
 
-    if (!customerFound) {
-      await postToSlack(
-        response_url,
+    if (!customer) {
+      await postToSlack(response_url,
         `⚠️ No customer found matching "*${customerQuery}*" in Linear. Check the spelling matches the Customers field exactly.`
       );
       return;
     }
 
-    const summary = await buildSummary(customerName, tickets);
+    const tickets = await fetchIssuesByCustomer(customer.id);
+    const summary = await buildSummary(customer.name, tickets);
     await postToSlack(response_url, summary);
   } catch (err) {
     console.error(err);
-    await postToSlack(
-      response_url,
+    await postToSlack(response_url,
       `❌ Something went wrong fetching tickets for *${customerQuery}*: ${err.message}`
     );
   }
