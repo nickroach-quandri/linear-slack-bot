@@ -18,19 +18,29 @@ function since30Days() {
 }
 
 async function fetchTickets(customerQuery) {
-  const cutoff = since30Days();
-
-  // Fetch all issues updated in the last 30 days
+  // Fetch all open/active issues (no date filter so we catch ALL open tickets)
   const issuesResult = await linear.issues({
     filter: {
-      updatedAt: { gte: cutoff },
+      state: {
+        type: { in: ["unstarted", "started", "backlog"] },
+      },
     },
     first: 250,
   });
 
-  const issues = issuesResult.nodes;
+  // Also fetch recently completed in last 30 days
+  const cutoff = since30Days();
+  const completedResult = await linear.issues({
+    filter: {
+      state: { type: { eq: "completed" } },
+      updatedAt: { gte: cutoff },
+    },
+    first: 100,
+  });
 
-  // Filter client-side by customer name appearing in title, description, or labels
+  const issues = [...issuesResult.nodes, ...completedResult.nodes];
+
+  // Filter client-side by customer name
   const q = customerQuery.toLowerCase();
 
   const matched = [];
@@ -49,8 +59,8 @@ async function fetchTickets(customerQuery) {
       matched.push({
         id: issue.identifier,
         title: issue.title,
-        status: state?.name || "Unknown",
-        stateType: state?.type || "unknown",  // started | completed | cancelled | backlog | unstarted
+        status: state?.name || "Unknown",    // exact name e.g. "In Progress", "QA", "Review"
+        stateType: state?.type || "unknown", // started | completed | cancelled | backlog | unstarted
         priority: issue.priority,
         updatedAt: issue.updatedAt,
         url: issue.url,
@@ -63,67 +73,80 @@ async function fetchTickets(customerQuery) {
 }
 
 function categorize(tickets) {
-  const now = new Date();
-  const sevenDaysAgo = new Date();
-  sevenDaysAgo.setDate(now.getDate() - 7);
-
   const inProgress = [];
+  const review = [];
+  const qa = [];
   const completed = [];
-  const overdue = [];
+  const todo = [];
+  const backlog = [];
 
   for (const t of tickets) {
-    const updated = new Date(t.updatedAt);
-    const isStale = updated < sevenDaysAgo;
+    const statusLower = t.status.toLowerCase();
 
-    if (t.stateType === "completed") {
+    if (statusLower.includes("progress")) {
+      inProgress.push(t);
+    } else if (statusLower.includes("review")) {
+      review.push(t);
+    } else if (statusLower === "qa" || statusLower.includes("qa")) {
+      qa.push(t);
+    } else if (t.stateType === "completed") {
       completed.push(t);
-    } else if (t.stateType === "started") {
-      if (isStale) {
-        overdue.push(t); // In-progress but not touched in 7+ days → stale/overdue
-      } else {
-        inProgress.push(t);
-      }
-    } else if (["unstarted", "backlog"].includes(t.stateType)) {
-      // Only include open/unstarted if updated recently
-      if (!isStale) inProgress.push(t);
+    } else if (
+      statusLower.includes("todo") ||
+      statusLower.includes("to-do") ||
+      statusLower.includes("to do") ||
+      t.stateType === "unstarted"
+    ) {
+      todo.push(t);
+    } else if (t.stateType === "backlog" || statusLower.includes("backlog")) {
+      backlog.push(t);
+    } else {
+      // Catch-all for any other started states
+      inProgress.push(t);
     }
   }
 
-  return { inProgress, completed, overdue };
+  return { inProgress, review, qa, completed, todo, backlog };
 }
 
 async function buildSummary(customer, tickets) {
   if (tickets.length === 0) {
-    return `No Linear tickets found for *${customer}* in the last 30 days.`;
+    return `No Linear tickets found for *${customer}*.`;
   }
 
-  const { inProgress, completed, overdue } = categorize(tickets);
+  const { inProgress, review, qa, completed, todo, backlog } = categorize(tickets);
 
-  const ticketData = JSON.stringify({ inProgress, completed, overdue }, null, 2);
+  const ticketData = JSON.stringify(
+    { inProgress, review, qa, completed, todo, backlog },
+    null,
+    2
+  );
 
   const msg = await anthropic.messages.create({
     model: "claude-sonnet-4-20250514",
-    max_tokens: 1000,
+    max_tokens: 1500,
     messages: [
       {
         role: "user",
-        content: `You are a CSM assistant. Generate a concise Slack summary for customer "${customer}" based on their Linear tickets from the last 30 days.
+        content: `You are a CSM assistant. Generate a concise Slack summary for customer "${customer}" based on their Linear tickets.
 
 Use this exact Slack markdown structure:
 
-*Linear Summary — ${customer}* (Last 30 days)
+*Linear Summary — ${customer}*
 
-${overdue.length > 0 ? "🔴 *Overdue / Stale*\n• [list tickets]" : ""}
-${inProgress.length > 0 ? "🟡 *In Progress*\n• [list tickets]" : ""}
-${completed.length > 0 ? "✅ *Recently Completed*\n• [list tickets]" : ""}
+🔵 *In Progress* — list each ticket with assignee and a one-line status note
+🔍 *In Review* — list each ticket with assignee and a one-line status note
+🧪 *QA* — list each ticket with assignee and a one-line status note
+✅ *Recently Completed* (last 30 days) — list each ticket with assignee
+📋 *To-Do & Backlog* — do NOT list individual tickets; instead write 2-3 sentences summarising themes, e.g. "8 to-do and 12 backlog items, mostly related to policy matching and download director issues."
 
 📊 *At a Glance*
-[2–3 sentence plain-English summary of the customer's ticket health and any notable trends or blockers]
+[3-4 sentence plain-English summary of overall ticket health, any blockers, and what the CSM should be aware of]
 
 Rules:
-- Each ticket line: "• [ID] <url|Title> — Assignee"
+- Each detailed ticket line format: "• [ID] <url|Title> — Assignee"
 - Keep it tight — no fluff
-- If a section is empty, omit it entirely
+- If a section has no tickets, omit it entirely
 - Use the real ticket URLs from the data
 
 Ticket data:
