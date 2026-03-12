@@ -20,60 +20,76 @@ function since30Days() {
 async function fetchTickets(customerQuery) {
   const cutoff = since30Days();
 
-  // Query by Linear's native Customers field — this is the source of truth
-  const customerFilter = {
-    customerNeedsWith: {
-      customer: {
-        name: { containsIgnoreCase: customerQuery },
-      },
-    },
-  };
+  // Step 1: Find the customer by name to get their ID
+  const customersResult = await linear.customers({
+    filter: { name: { containsIgnoreCase: customerQuery } },
+    first: 5,
+  });
 
-  const [openResult, completedResult] = await Promise.all([
-    linear.issues({
-      filter: {
-        ...customerFilter,
-        state: { type: { in: ["unstarted", "started", "backlog"] } },
-      },
-      first: 250,
-      includeArchived: false,
-    }),
-    linear.issues({
-      filter: {
-        ...customerFilter,
-        state: { type: { eq: "completed" } },
-        updatedAt: { gte: cutoff },
-      },
-      first: 250,
-      includeArchived: false,
-    }),
-  ]);
+  if (!customersResult.nodes.length) {
+    return { tickets: [], customerFound: false };
+  }
 
-  const allIssues = [...openResult.nodes, ...completedResult.nodes];
+  const customer = customersResult.nodes[0];
 
-  // Resolve state + assignee in parallel
-  const matched = await Promise.all(
-    allIssues.map(async (issue) => {
-      const [state, assignee] = await Promise.all([
-        issue.state,
-        issue.assignee,
-      ]);
+  // Step 2: Get all customer needs (which link customers to issues) 
+  const needsResult = await linear.customerNeeds({
+    filter: { customer: { id: { eq: customer.id } } },
+    first: 250,
+  });
 
-      return {
-        id: issue.identifier,
-        title: issue.title,
-        description: (issue.description || "").slice(0, 200),
-        status: state?.name || "Unknown",
-        stateType: state?.type || "unknown",
-        priority: issue.priority,
-        updatedAt: issue.updatedAt,
-        url: issue.url,
-        assignee: assignee?.name || "Unassigned",
-      };
+  if (!needsResult.nodes.length) {
+    return { tickets: [], customerFound: true, customerName: customer.name };
+  }
+
+  // Step 3: Extract issue IDs from customer needs
+  const issueIds = [];
+  for (const need of needsResult.nodes) {
+    const issue = await need.issue;
+    if (issue?.id) issueIds.push(issue.id);
+  }
+
+  if (!issueIds.length) {
+    return { tickets: [], customerFound: true, customerName: customer.name };
+  }
+
+  // Step 4: Fetch full issue details for all linked issues in parallel
+  const issueDetails = await Promise.all(
+    issueIds.map(async (id) => {
+      try {
+        const issue = await linear.issue(id);
+        const [state, assignee] = await Promise.all([
+          issue.state,
+          issue.assignee,
+        ]);
+
+        const stateType = state?.type || "unknown";
+        const updatedAt = new Date(issue.updatedAt);
+
+        // Skip completed tickets older than 30 days
+        if (stateType === "completed" && updatedAt < cutoff) return null;
+        // Skip cancelled tickets
+        if (stateType === "cancelled") return null;
+
+        return {
+          id: issue.identifier,
+          title: issue.title,
+          description: (issue.description || "").slice(0, 200),
+          status: state?.name || "Unknown",
+          stateType,
+          priority: issue.priority,
+          updatedAt: issue.updatedAt,
+          url: issue.url,
+          assignee: assignee?.name || "Unassigned",
+        };
+      } catch {
+        return null;
+      }
     })
   );
 
-  return matched;
+  const tickets = issueDetails.filter(Boolean);
+  return { tickets, customerFound: true, customerName: customer.name };
 }
 
 function categorize(tickets) {
@@ -116,9 +132,9 @@ function categorize(tickets) {
   };
 }
 
-async function buildSummary(customer, tickets) {
-  if (tickets.length === 0) {
-    return `No Linear tickets found for *${customer}*. Make sure the customer name matches exactly what's set in the Customers field in Linear.`;
+async function buildSummary(customerName, tickets) {
+  if (!tickets.length) {
+    return `No active Linear tickets found for *${customerName}*.`;
   }
 
   const { inProgress, review, qa, completed, todo, backlog } = categorize(tickets);
@@ -129,11 +145,11 @@ async function buildSummary(customer, tickets) {
     messages: [
       {
         role: "user",
-        content: `You are a CSM assistant. Generate a Slack summary for customer "${customer}".
+        content: `You are a CSM assistant. Generate a Slack summary for customer "${customerName}".
 
 EXACT FORMAT:
 
-*Linear Summary — ${customer}*
+*Linear Summary — ${customerName}*
 _${inProgress.length} In Progress · ${review.length} In Review · ${qa.length} QA · ${todo.length} To-Do · ${backlog.length} Backlog · ${completed.length} Recently Completed_
 
 ---
@@ -204,9 +220,9 @@ async function postToSlack(responseUrl, text) {
 
 app.post("/slack/linear-summary", async (req, res) => {
   const { text, response_url } = req.body;
-  const customer = (text || "").trim();
+  const customerQuery = (text || "").trim();
 
-  if (!customer) {
+  if (!customerQuery) {
     return res.json({
       response_type: "ephemeral",
       text: "⚠️ Please provide a customer name. Usage: `/linear-summary brokerlink`",
@@ -215,18 +231,27 @@ app.post("/slack/linear-summary", async (req, res) => {
 
   res.json({
     response_type: "ephemeral",
-    text: `🔍 Fetching Linear tickets for *${customer}* via Customers field... hang tight!`,
+    text: `🔍 Fetching Linear tickets for *${customerQuery}*... hang tight!`,
   });
 
   try {
-    const tickets = await fetchTickets(customer);
-    const summary = await buildSummary(customer, tickets);
+    const { tickets, customerFound, customerName } = await fetchTickets(customerQuery);
+
+    if (!customerFound) {
+      await postToSlack(
+        response_url,
+        `⚠️ No customer found matching "*${customerQuery}*" in Linear. Check the spelling matches the Customers field exactly.`
+      );
+      return;
+    }
+
+    const summary = await buildSummary(customerName, tickets);
     await postToSlack(response_url, summary);
   } catch (err) {
     console.error(err);
     await postToSlack(
       response_url,
-      `❌ Something went wrong fetching tickets for *${customer}*: ${err.message}`
+      `❌ Something went wrong fetching tickets for *${customerQuery}*: ${err.message}`
     );
   }
 });
