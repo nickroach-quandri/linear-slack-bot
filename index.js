@@ -18,44 +18,40 @@ function since30Days() {
 }
 
 async function fetchTickets(customerQuery) {
-  const q = customerQuery.toLowerCase();
   const cutoff = since30Days();
 
-  // Use Linear's search to find matching issues directly — much faster than
-  // fetching everything and filtering client-side
+  // Query by Linear's native Customers field — this is the source of truth
+  const customerFilter = {
+    customerNeedsWith: {
+      customer: {
+        name: { containsIgnoreCase: customerQuery },
+      },
+    },
+  };
+
   const [openResult, completedResult] = await Promise.all([
     linear.issues({
       filter: {
+        ...customerFilter,
         state: { type: { in: ["unstarted", "started", "backlog"] } },
-        or: [
-          { title: { containsIgnoreCase: customerQuery } },
-          { description: { containsIgnoreCase: customerQuery } },
-          { labels: { name: { containsIgnoreCase: customerQuery } } },
-          { team: { name: { containsIgnoreCase: customerQuery } } },
-        ],
       },
       first: 250,
       includeArchived: false,
     }),
     linear.issues({
       filter: {
+        ...customerFilter,
         state: { type: { eq: "completed" } },
         updatedAt: { gte: cutoff },
-        or: [
-          { title: { containsIgnoreCase: customerQuery } },
-          { description: { containsIgnoreCase: customerQuery } },
-          { labels: { name: { containsIgnoreCase: customerQuery } } },
-          { team: { name: { containsIgnoreCase: customerQuery } } },
-        ],
       },
-      first: 100,
+      first: 250,
       includeArchived: false,
     }),
   ]);
 
   const allIssues = [...openResult.nodes, ...completedResult.nodes];
 
-  // Resolve state, assignee in parallel per issue (no comments for speed)
+  // Resolve state + assignee in parallel
   const matched = await Promise.all(
     allIssues.map(async (issue) => {
       const [state, assignee] = await Promise.all([
@@ -104,7 +100,6 @@ function categorize(tickets) {
     else inProgress.push(t);
   }
 
-  // Sort by priority (1=urgent first, 0/null = lowest)
   const byPriority = (a, b) => {
     const pa = a.priority === 0 ? 99 : (a.priority || 99);
     const pb = b.priority === 0 ? 99 : (b.priority || 99);
@@ -123,7 +118,7 @@ function categorize(tickets) {
 
 async function buildSummary(customer, tickets) {
   if (tickets.length === 0) {
-    return `No Linear tickets found for *${customer}*.`;
+    return `No Linear tickets found for *${customer}*. Make sure the customer name matches exactly what's set in the Customers field in Linear.`;
   }
 
   const { inProgress, review, qa, completed, todo, backlog } = categorize(tickets);
@@ -218,10 +213,9 @@ app.post("/slack/linear-summary", async (req, res) => {
     });
   }
 
-  // Acknowledge immediately (Slack requires response within 3s)
   res.json({
     response_type: "ephemeral",
-    text: `🔍 Fetching Linear tickets for *${customer}*... hang tight, usually 15–30 seconds.`,
+    text: `🔍 Fetching Linear tickets for *${customer}* via Customers field... hang tight!`,
   });
 
   try {
