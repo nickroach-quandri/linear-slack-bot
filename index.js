@@ -29,12 +29,15 @@ async function linearQuery(query, variables = {}) {
 async function findCustomer(customerQuery) {
   const data = await linearQuery(`
     query FindCustomer($query: String!) {
-      customers(filter: { name: { containsIgnoreCase: $query } }, first: 5) {
-        nodes { id name }
+      customers(filter: { name: { containsIgnoreCase: $query } }, first: 10) {
+        nodes { id name updatedAt }
       }
     }
   `, { query: customerQuery });
-  return data.customers.nodes[0] || null;
+  // Pick most recently updated customer (avoids grabbing legacy duplicates like "Brokerlink-Standard")
+  const nodes = data.customers.nodes;
+  if (!nodes.length) return null;
+  return nodes.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
 }
 
 // ── Fetch all issues linked to a customer via customer needs ───────────────
