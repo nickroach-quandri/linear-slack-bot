@@ -24,7 +24,7 @@ async function linearQuery(query, variables = {}) {
   return json.data;
 }
 
-// ── Fetch all customers matching the query name ────────────────────────────
+// ── Find customer by name ──────────────────────────────────────────────────
 
 async function findCustomer(customerQuery) {
   const data = await linearQuery(`
@@ -34,9 +34,9 @@ async function findCustomer(customerQuery) {
       }
     }
   `, { query: customerQuery });
-  // Pick most recently updated customer (avoids grabbing legacy duplicates like "Brokerlink-Standard")
   const nodes = data.customers.nodes;
   if (!nodes.length) return null;
+  // Pick most recently updated (avoids legacy duplicates like "Brokerlink-Standard")
   return nodes.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
 }
 
@@ -46,7 +46,6 @@ async function fetchIssuesByCustomer(customerId) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - 30);
 
-  // Paginate through all customer needs for this customer
   let allNeeds = [];
   let cursor = null;
   let hasMore = true;
@@ -83,7 +82,6 @@ async function fetchIssuesByCustomer(customerId) {
     cursor = page.pageInfo.endCursor;
   }
 
-  // Extract and deduplicate issues
   const seen = new Set();
   const tickets = [];
 
@@ -95,9 +93,7 @@ async function fetchIssuesByCustomer(customerId) {
     const stateType = issue.state?.type || "unknown";
     const updatedAt = new Date(issue.updatedAt);
 
-    // Skip cancelled tickets
     if (stateType === "cancelled") continue;
-    // Skip completed tickets older than 30 days
     if (stateType === "completed" && updatedAt < cutoff) continue;
 
     tickets.push({
@@ -148,9 +144,9 @@ function categorize(tickets) {
   };
 }
 
-// ── Build AI summary ───────────────────────────────────────────────────────
+// ── Build internal Slack summary ───────────────────────────────────────────
 
-async function buildSummary(customerName, tickets) {
+async function buildSlackSummary(customerName, tickets) {
   if (!tickets.length) {
     return `No active Linear tickets found for *${customerName}*.`;
   }
@@ -211,6 +207,75 @@ BACKLOG: ${JSON.stringify(backlog, null, 2)}`,
   return msg.content[0].text;
 }
 
+// ── Build customer-facing email draft ─────────────────────────────────────
+
+async function buildEmailSummary(customerName, tickets) {
+  if (!tickets.length) {
+    return `No active Linear tickets found for *${customerName}*.`;
+  }
+
+  const { inProgress, review, qa, completed, todo, backlog } = categorize(tickets);
+  const activeCount = inProgress.length + review.length + qa.length;
+  const month = new Date().toLocaleString("default", { month: "long", year: "numeric" });
+
+  // Strip internal-only fields before sending to AI
+  const clean = (arr) => arr.map(({ title, description }) => ({ title, description }));
+
+  const msg = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 2000,
+    messages: [{
+      role: "user",
+      content: `You are a Customer Success Manager writing a polished product update email to a customer called "${customerName}".
+
+Write a professional but warm email they can receive directly. Use plain English — no internal jargon, no ticket IDs, no assignee names, no links.
+
+You MAY reference ticket counts naturally in prose (e.g. "we're actively working on ${activeCount} items for your team").
+
+STRUCTURE (use these exact bold headers):
+
+Subject: Quandri Product Update — ${customerName} | ${month}
+
+Hi [Name],
+
+[1–2 sentence warm opener referencing the month and that this is their regular product update]
+
+**What We're Actively Working On**
+[Flowing prose paragraph(s) covering the ${activeCount} active tickets across In Progress, In Review, and QA. Group related items into themes. Write as if explaining to a non-technical business person. No bullet points — full sentences only.]
+
+**Recently Shipped**
+[Flowing prose paragraph covering the ${completed.length} completed items. What value did these deliver? Keep it positive and outcome-focused.]
+
+**Coming Up Next**
+[Flowing prose paragraph summarising themes from the ${todo.length} to-do and ${backlog.length} backlog items. What are the priorities? What should they expect in the coming weeks?]
+
+[Warm closing sentence inviting questions or a call. Sign off as "The Quandri Team".]
+
+RULES:
+- No ticket IDs, no URLs, no assignee names
+- No bullet points anywhere — prose only
+- Keep each section to 2–4 sentences
+- Translate technical titles into plain outcomes (e.g. "Duplicate Policy IN/OUT" becomes "resolving an issue causing duplicate policy entries")
+- Tone: professional, warm, confident
+
+--- TICKET DATA ---
+IN PROGRESS (${inProgress.length}): ${JSON.stringify(clean(inProgress), null, 2)}
+IN REVIEW (${review.length}): ${JSON.stringify(clean(review), null, 2)}
+QA (${qa.length}): ${JSON.stringify(clean(qa), null, 2)}
+RECENTLY COMPLETED (${completed.length}): ${JSON.stringify(clean(completed), null, 2)}
+TODO (${todo.length}): ${JSON.stringify(clean(todo), null, 2)}
+BACKLOG (${backlog.length}): ${JSON.stringify(clean(backlog), null, 2)}`,
+    }],
+  });
+
+  const emailText = msg.content[0].text;
+
+  // Wrap in a code block so it's easy to copy-paste
+  return `📧 *Email Draft — ${customerName}*\n_Copy the text below into your email client_\n\`\`\`\n${emailText}\n\`\`\``;
+}
+
+// ── Slack helpers ──────────────────────────────────────────────────────────
+
 async function postToSlack(responseUrl, text) {
   await fetch(responseUrl, {
     method: "POST",
@@ -223,18 +288,24 @@ async function postToSlack(responseUrl, text) {
 
 app.post("/slack/linear-summary", async (req, res) => {
   const { text, response_url } = req.body;
-  const customerQuery = (text || "").trim();
+  const parts = (text || "").trim().split(/\s+/);
+
+  // Parse: /linear-summary <customer name> [email]
+  const emailMode = parts[parts.length - 1].toLowerCase() === "email";
+  const customerQuery = emailMode ? parts.slice(0, -1).join(" ") : parts.join(" ");
 
   if (!customerQuery) {
     return res.json({
       response_type: "ephemeral",
-      text: "⚠️ Please provide a customer name. Usage: `/linear-summary brokerlink`",
+      text: "⚠️ Please provide a customer name.\nUsage:\n• `/linear-summary brokerlink` — internal Slack summary\n• `/linear-summary brokerlink email` — customer-ready email draft",
     });
   }
 
+  const modeLabel = emailMode ? "📧 email draft" : "📋 Slack summary";
+
   res.json({
     response_type: "ephemeral",
-    text: `🔍 Fetching Linear tickets for *${customerQuery}*... hang tight!`,
+    text: `🔍 Generating ${modeLabel} for *${customerQuery}*... hang tight!`,
   });
 
   try {
@@ -248,12 +319,15 @@ app.post("/slack/linear-summary", async (req, res) => {
     }
 
     const tickets = await fetchIssuesByCustomer(customer.id);
-    const summary = await buildSummary(customer.name, tickets);
+    const summary = emailMode
+      ? await buildEmailSummary(customer.name, tickets)
+      : await buildSlackSummary(customer.name, tickets);
+
     await postToSlack(response_url, summary);
   } catch (err) {
     console.error(err);
     await postToSlack(response_url,
-      `❌ Something went wrong fetching tickets for *${customerQuery}*: ${err.message}`
+      `❌ Something went wrong for *${customerQuery}*: ${err.message}`
     );
   }
 });
